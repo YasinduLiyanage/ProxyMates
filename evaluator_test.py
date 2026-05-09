@@ -13,16 +13,25 @@ SETUP (3 terminals):
 import time
 import re
 import sys
+import json
 import httpx
+from urllib.parse import urlparse
 
-API = "http://localhost:8000"
+API = "https://proxymates-production.up.railway.app"
 WEBHOOK = "http://localhost:9000"
 PASS = 0
 FAIL = 0
 ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
+# Detect webhook.site vs local receiver
+IS_WEBHOOK_SITE = "webhook.site" in WEBHOOK
+if IS_WEBHOOK_SITE:
+    # webhook.site URL: https://webhook.site/<token> — extract token
+    WEBHOOK_TOKEN = urlparse(WEBHOOK).path.strip("/").split("/")[0]
+    WEBHOOK_API = f"https://webhook.site/token/{WEBHOOK_TOKEN}"
+
 client = httpx.Client(base_url=API, timeout=30.0)
-wh_client = httpx.Client(base_url=WEBHOOK, timeout=10.0)
+wh_client = httpx.Client(base_url=WEBHOOK if not IS_WEBHOOK_SITE else WEBHOOK_API, timeout=15.0)
 
 
 def log(name: str, ok: bool, detail: str = ""):
@@ -53,11 +62,42 @@ def section(title):
 
 
 def clear_webhook_receiver():
-    wh_client.delete("/received")
+    if IS_WEBHOOK_SITE:
+        try:
+            wh_client.delete("/request")
+        except Exception:
+            pass
+    else:
+        wh_client.delete("/received")
 
 
 def get_webhooks():
-    return wh_client.get("/received").json()
+    """Return list of {path, body} for all webhook deliveries received."""
+    if IS_WEBHOOK_SITE:
+        # webhook.site API returns: { data: [ { url, content (string), method, ... } ] }
+        try:
+            r = wh_client.get("/requests", params={"sorting": "newest", "per_page": 100})
+            data = r.json().get("data", [])
+            results = []
+            for entry in data:
+                url = entry.get("url", "")
+                # Strip the webhook.site origin so we get the path component (e.g. /generic, /slack)
+                path = urlparse(url).path
+                # path will be like /<token>/generic — strip the token prefix
+                parts = path.strip("/").split("/", 1)
+                rel_path = "/" + (parts[1] if len(parts) > 1 else "")
+                content = entry.get("content", "")
+                try:
+                    body = json.loads(content) if content else {}
+                except Exception:
+                    body = {}
+                results.append({"path": rel_path, "body": body})
+            return results
+        except Exception as e:
+            print(f"  [warn] could not fetch webhook.site requests: {e}")
+            return []
+    else:
+        return wh_client.get("/received").json()
 
 
 def wait_for_check(seconds=5):
@@ -70,23 +110,51 @@ def wait_for_check(seconds=5):
 # ===========================================================================
 def preflight():
     section("Pre-flight checks")
-    try:
-        r = client.get("/health")
-        ok("ProxyMaze server reachable", r.status_code == 200)
-    except Exception as e:
-        print(f"  FATAL: Cannot reach ProxyMaze at {API}: {e}")
-        print(f"  Start it: uvicorn main:app --port 8000")
+    # Render free tier cold-start / fresh deploy can take up to 90s
+    # Retry /health with backoff before giving up
+    print("  Probing service (Render cold-starts can take ~60s)...")
+    deadline = time.time() + 120  # up to 2 minutes
+    last_status = None
+    last_err = None
+    while time.time() < deadline:
+        try:
+            r = client.get("/health", timeout=20.0)
+            last_status = r.status_code
+            if r.status_code == 200:
+                try:
+                    if r.json().get("status") == "ok":
+                        ok("ProxyMaze server reachable", True)
+                        break
+                except Exception:
+                    pass
+            print(f"    got HTTP {r.status_code}, retrying in 5s...")
+        except Exception as e:
+            last_err = e
+            print(f"    connection error ({type(e).__name__}), retrying in 5s...")
+        time.sleep(5)
+    else:
+        ok("ProxyMaze server reachable", False,
+           f"last status={last_status}, last err={last_err}")
+        print(f"  FATAL: Service did not come up at {API}")
         sys.exit(1)
 
     try:
-        r = wh_client.get("/received")
-        ok("Webhook receiver reachable", r.status_code == 200)
+        if IS_WEBHOOK_SITE:
+            r = wh_client.get("/requests")
+            ok("webhook.site API reachable", r.status_code == 200)
+        else:
+            r = wh_client.get("/received")
+            ok("Webhook receiver reachable", r.status_code == 200)
     except Exception as e:
         print(f"  FATAL: Cannot reach webhook receiver at {WEBHOOK}: {e}")
-        print(f"  Start it: python webhook_receiver.py")
+        if not IS_WEBHOOK_SITE:
+            print(f"  Start it: python webhook_receiver.py")
         sys.exit(1)
 
     clear_webhook_receiver()
+    if IS_WEBHOOK_SITE:
+        # webhook.site captures take a moment to be queryable — short pause for clean state
+        time.sleep(1)
 
 
 # ===========================================================================
@@ -370,7 +438,7 @@ def test_alerts_and_webhooks():
         eq("CONSISTENCY: failed_proxies count", alert["failed_proxies"], len(down_ids_proxies))
 
     # Check webhook payloads received
-    time.sleep(2)  # give deliveries a moment
+    time.sleep(4 if IS_WEBHOOK_SITE else 2)  # webhook.site needs more time to record
     webhooks_received = get_webhooks()
     generic_fired = [w for w in webhooks_received if w["path"] == "/generic" and w["body"].get("event") == "alert.fired"]
     ok("generic webhook received alert.fired", len(generic_fired) >= 1,
