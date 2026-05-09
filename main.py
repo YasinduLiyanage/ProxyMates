@@ -118,6 +118,13 @@ def _build_resolved_payload(alert: dict[str, Any]) -> dict[str, Any]:
         "event": "alert.resolved",
         "alert_id": alert["alert_id"],
         "resolved_at": alert["resolved_at"],
+        "fired_at": alert.get("fired_at"),
+        "failure_rate": alert.get("failure_rate"),
+        "total_proxies": alert.get("total_proxies"),
+        "failed_proxies": alert.get("failed_proxies"),
+        "failed_proxy_ids": list(alert.get("failed_proxy_ids") or []),
+        "threshold": alert.get("threshold"),
+        "message": alert.get("message"),
     }
 
 
@@ -127,34 +134,73 @@ def _build_slack_payload(integration: dict[str, Any], alert: dict[str, Any], eve
     fr_pct = f"{fr * 100:.1f}%"
 
     if event_type == "alert.fired":
-        text = f"Proxy pool breach: {fr_pct} failure rate"
+        header_text = ":rotating_light: Proxy Pool Alert Fired"
+        summary_text = f"Proxy pool breach: {fr_pct} failure rate"
         color = "#FF0000"
+        ts_label = "Fired At"
+        ts_value = alert.get("fired_at", "")
     else:
-        text = f"Proxy pool alert resolved (was {fr_pct} failure rate)"
+        header_text = ":white_check_mark: Proxy Pool Alert Resolved"
+        summary_text = f"Proxy pool alert resolved (was {fr_pct} failure rate)"
         color = "#36A64F"
+        ts_label = "Resolved At"
+        ts_value = alert.get("resolved_at", "") or alert.get("fired_at", "")
 
     failed_ids_str = ", ".join(alert.get("failed_proxy_ids") or []) or "(none)"
 
-    fields = [
-        {"title": "Alert ID", "value": str(alert["alert_id"]), "short": True},
-        {"title": "Failure Rate", "value": fr_pct, "short": True},
-        {"title": "Failed Proxies", "value": str(alert["failed_proxies"]), "short": True},
-        {"title": "Threshold", "value": "20%", "short": True},
-        {"title": "Failed IDs", "value": failed_ids_str, "short": False},
-        {"title": "Fired At", "value": alert["fired_at"], "short": True},
+    # Block Kit blocks (modern Slack format)
+    blocks = [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": header_text, "emoji": True},
+        },
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"*{summary_text}*"},
+        },
+        {
+            "type": "section",
+            "fields": [
+                {"type": "mrkdwn", "text": f"*Alert ID:*\n{alert['alert_id']}"},
+                {"type": "mrkdwn", "text": f"*Failure Rate:*\n{fr_pct}"},
+                {"type": "mrkdwn", "text": f"*Failed Proxies:*\n{alert.get('failed_proxies', 0)}"},
+                {"type": "mrkdwn", "text": "*Threshold:*\n20%"},
+            ],
+        },
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"*Failed IDs:*\n`{failed_ids_str}`"},
+        },
+        {
+            "type": "context",
+            "elements": [
+                {"type": "mrkdwn", "text": f"*{ts_label}:* {ts_value} | ProxyMaze Monitoring"}
+            ],
+        },
+    ]
+
+    # Legacy attachments kept for backwards compatibility
+    attachments = [
+        {
+            "color": color,
+            "fields": [
+                {"title": "Alert ID", "value": str(alert["alert_id"]), "short": True},
+                {"title": "Failure Rate", "value": fr_pct, "short": True},
+                {"title": "Failed Proxies", "value": str(alert.get("failed_proxies", 0)), "short": True},
+                {"title": "Threshold", "value": "20%", "short": True},
+                {"title": "Failed IDs", "value": failed_ids_str, "short": False},
+                {"title": ts_label, "value": ts_value, "short": True},
+            ],
+            "footer": "ProxyMaze Monitoring",
+            "ts": unix_epoch_seconds(),
+        }
     ]
 
     return {
         "username": username,
-        "text": text,
-        "attachments": [
-            {
-                "color": color,
-                "fields": fields,
-                "footer": "ProxyMaze Monitoring",
-                "ts": unix_epoch_seconds(),
-            }
-        ],
+        "text": summary_text,
+        "blocks": blocks,
+        "attachments": attachments,
     }
 
 
@@ -164,7 +210,7 @@ def _build_discord_payload(integration: dict[str, Any], alert: dict[str, Any], e
 
     if event_type == "alert.fired":
         title = "Proxy Pool Alert Fired"
-        description = f"Proxy pool breach detected: {fr_pct} failure rate"
+        description = f"Proxy pool breach detected: **{fr_pct}** failure rate"
         color = 16711680  # red
     else:
         title = "Proxy Pool Alert Resolved"
@@ -176,13 +222,17 @@ def _build_discord_payload(integration: dict[str, Any], alert: dict[str, Any], e
     fields = [
         {"name": "Alert ID", "value": str(alert["alert_id"]), "inline": True},
         {"name": "Failure Rate", "value": fr_pct, "inline": True},
-        {"name": "Failed Proxies", "value": str(alert["failed_proxies"]), "inline": True},
+        {"name": "Failed Proxies", "value": str(alert.get("failed_proxies", 0)), "inline": True},
         {"name": "Threshold", "value": "20%", "inline": True},
         {"name": "Failed IDs", "value": failed_ids_str, "inline": False},
     ]
 
+    # Discord expects ISO 8601 timestamp with timezone offset (e.g. 2026-05-09T12:34:56.789Z)
+    embed_ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
     return {
         "username": integration.get("username") or "ProxyWatch",
+        "content": title,
         "embeds": [
             {
                 "title": title,
@@ -190,6 +240,7 @@ def _build_discord_payload(integration: dict[str, Any], alert: dict[str, Any], e
                 "color": color,
                 "fields": fields,
                 "footer": {"text": "ProxyMaze Monitoring"},
+                "timestamp": embed_ts,
             }
         ],
     }
@@ -208,13 +259,13 @@ async def _deliver(url: str, payload: dict, alert_id: str, event_type: str, key_
     _in_flight_keys.add(key)
 
     # Aggressive retry strategy: short backoff, fast retries, fits well within 60s window
-    # Backoff sequence: 0.3, 0.5, 0.8, 1.2, 1.8, 2.5, 3.5, 5.0 (cap)
-    backoff = 0.3
-    max_backoff = 5.0
+    # Backoff sequence: 0.2, 0.3, 0.45, 0.7, 1.0, 1.5, 2.3, 3.0 (cap)
+    backoff = 0.2
+    max_backoff = 3.0
     attempt = 0
-    max_attempts = 200  # plenty of attempts within 60s with short backoff
+    max_attempts = 80  # ~60-90s of retry budget with short backoff
     started = time.time()
-    deadline_seconds = 55  # try hard for ~55s, then back off slower (still keep retrying forever)
+    deadline_seconds = 90  # hard cap; after this, give up so tasks don't linger forever
 
     headers = {
         "Content-Type": "application/json",
@@ -226,7 +277,7 @@ async def _deliver(url: str, payload: dict, alert_id: str, event_type: str, key_
     request_timeout = httpx.Timeout(connect=5.0, read=5.0, write=5.0, pool=5.0)
 
     try:
-        while attempt < max_attempts:
+        while attempt < max_attempts and (time.time() - started) < deadline_seconds:
             attempt += 1
             try:
                 async with httpx.AsyncClient(
@@ -266,19 +317,14 @@ async def _deliver(url: str, payload: dict, alert_id: str, event_type: str, key_
                 print(f"[deliver] DROP {event_type} -> {url} (attempt {attempt}, {r.status_code} non-retryable)", flush=True)
                 return
 
-            except (httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError,
-                    httpx.ReadError, httpx.WriteError, httpx.NetworkError) as e:
-                print(f"[deliver] network err {event_type} -> {url} (attempt {attempt}, {type(e).__name__})", flush=True)
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 1.5, max_backoff)
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
-                print(f"[deliver] error {event_type} -> {url} (attempt {attempt}, {type(e).__name__}: {e})", flush=True)
+                print(f"[deliver] network err {event_type} -> {url} (attempt {attempt}, {type(e).__name__}: {e})", flush=True)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 1.5, max_backoff)
 
-            # After deadline_seconds, slow down to once-per-30s to avoid burning resources
-            if time.time() - started > deadline_seconds:
-                await asyncio.sleep(30.0)
+        print(f"[deliver] EXHAUSTED {event_type} -> {url} (attempts={attempt}, elapsed={time.time()-started:.1f}s)", flush=True)
     finally:
         # Always release the in-flight gate, whether we succeeded, gave up, or got cancelled.
         _in_flight_keys.discard(key)
@@ -331,19 +377,13 @@ def _fire_webhooks(alert: dict[str, Any], event_type: str) -> None:
 # ---------------------------------------------------------------------------
 
 async def _probe_proxy(client: httpx.AsyncClient, url: str) -> str:
-    """Probe a single proxy. 2xx = up. Timeout/connection-error/4xx/5xx all = down."""
+    """Probe a single proxy. 2xx = up. Anything else (timeout, connect error,
+    SSL failure, malformed URL, 3xx-after-redirect, 4xx, 5xx) = down."""
     try:
         r = await client.get(url)
-        if 200 <= r.status_code < 300:
-            return "up"
-        # Anything else (including 4xx, 5xx) is down
-        return "down"
-    except httpx.TimeoutException:
-        return "down"
-    except httpx.ConnectError:
-        return "down"
-    except httpx.NetworkError:
-        return "down"
+        return "up" if 200 <= r.status_code < 300 else "down"
+    except asyncio.CancelledError:
+        raise
     except Exception:
         return "down"
 
@@ -534,7 +574,7 @@ async def health():
 @app.get("/version")
 async def version():
     return {
-        "build": "v3-gc-fix-fly-ready",
+        "build": "v4-block-kit-discord-ts",
         "monitor_alive": monitor_task is not None and not monitor_task.done(),
         "wake_event_ready": wake_event is not None,
         "inflight_tasks": len(_inflight_tasks),
