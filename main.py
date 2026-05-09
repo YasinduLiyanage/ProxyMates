@@ -8,7 +8,7 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urldefrag, urljoin, urlparse, urlunparse
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -46,6 +46,33 @@ def extract_proxy_id(url: str) -> str:
     cleaned = url.split("?")[0].split("#")[0].rstrip("/")
     seg = cleaned.rsplit("/", 1)[-1]
     return seg or cleaned
+
+
+# 20% threshold using integer ratios — avoids float edge cases near 0.2 that
+# flap between breach / resolved across monitor cycles ("duplicate" firings).
+def _pct_at_or_above_breach(down_count: int, total: int) -> bool:
+    return total > 0 and down_count * 100 >= total * 20
+
+
+def _pct_strictly_below_breach(down_count: int, total: int) -> bool:
+    return total <= 0 or down_count * 100 < total * 20
+
+
+def _upgrade_http_to_https_receiver(url: str) -> str:
+    """Torch capture URLs are commonly issued as http://evaluator...; rewriting
+    avoids http→https redirect chains during POST webhook delivery."""
+    p = urlparse(url)
+    if (p.scheme or "").lower() != "http":
+        return url
+    if (p.hostname or "").lower() == "evaluator.torchproxies.com":
+        return urlunparse(("https", p.netloc, p.path, p.params, p.query, p.fragment))
+    return url
+
+
+def _canonical_receiver_url(url: str) -> str:
+    u = url.strip()
+    u, _ = urldefrag(u)
+    return _upgrade_http_to_https_receiver(u)
 
 
 # ---------------------------------------------------------------------------
@@ -141,7 +168,10 @@ def _build_slack_payload(integration: dict[str, Any], alert: dict[str, Any], eve
         ts_value = alert.get("fired_at", "")
     else:
         header_text = ":white_check_mark: Proxy Pool Alert Resolved"
-        summary_text = f"Proxy pool alert resolved (was {fr_pct} failure rate)"
+        if fr <= 1e-9:
+            summary_text = "Proxy pool recovered (below failure threshold)"
+        else:
+            summary_text = f"Proxy pool alert resolved (failure rate now {fr_pct})"
         color = "#36A64F"
         ts_label = "Resolved At"
         ts_value = alert.get("resolved_at", "") or alert.get("fired_at", "")
@@ -214,7 +244,10 @@ def _build_discord_payload(integration: dict[str, Any], alert: dict[str, Any], e
         color = 16711680  # red
     else:
         title = "Proxy Pool Alert Resolved"
-        description = f"Proxy pool alert resolved (was {fr_pct} failure rate)"
+        if fr <= 1e-9:
+            description = "Proxy pool recovered (**below threshold**)."
+        else:
+            description = f"Proxy pool alert resolved; failure rate now **{fr_pct}**."
         color = 3066993  # green
 
     failed_ids_str = ", ".join(alert.get("failed_proxy_ids") or []) or "(none)"
@@ -250,8 +283,38 @@ def _build_discord_payload(integration: dict[str, Any], alert: dict[str, Any], e
 # Webhook delivery (with retry + exactly-once)
 # ---------------------------------------------------------------------------
 
+# httpx with follow_redirects=True can rewrite POST→GET on 302; strict receivers
+# then return 405. Follow redirects manually and always re-POST to Location.
+_REDIRECT_STATUS = frozenset({301, 302, 303, 307, 308})
+_WEBHOOK_MAX_REDIRECT_HOPS = 15
+
+
+async def _post_webhook_preserving_redirects(
+    client: httpx.AsyncClient,
+    url: str,
+    payload: dict[str, Any],
+    headers: dict[str, str],
+) -> httpx.Response:
+    current = url
+    r: httpx.Response | None = None
+    for _ in range(_WEBHOOK_MAX_REDIRECT_HOPS):
+        r = await client.post(current, json=payload, headers=headers)
+        if r.status_code not in _REDIRECT_STATUS:
+            return r
+        loc = r.headers.get("location")
+        if not loc:
+            return r
+        nxt = urljoin(str(r.url), loc.strip())
+        if nxt == current:
+            return r
+        current = nxt
+    assert r is not None
+    return r
+
+
 async def _deliver(url: str, payload: dict, alert_id: str, event_type: str, key_suffix: str = "") -> None:
     """POST payload to url with aggressive retries. Exactly-once per (alert_id, event, url+suffix)."""
+    url = _canonical_receiver_url(url)
     key = (alert_id, event_type + key_suffix, url)
 
     # Already delivered, or another task is currently delivering this exact event → skip.
@@ -260,12 +323,12 @@ async def _deliver(url: str, payload: dict, alert_id: str, event_type: str, key_
 
     _in_flight_keys.add(key)
 
-    backoff = 0.2
-    max_backoff = 3.0
+    backoff = 0.05
+    max_backoff = 2.0
     attempt = 0
-    max_attempts = 80
+    max_attempts = 200
     started = time.time()
-    deadline_seconds = 90
+    deadline_seconds = 240
 
     headers = {
         "Content-Type": "application/json",
@@ -286,66 +349,65 @@ async def _deliver(url: str, payload: dict, alert_id: str, event_type: str, key_
     )
 
     try:
-        while attempt < max_attempts and (time.time() - started) < deadline_seconds:
-            attempt += 1
+        async with httpx.AsyncClient(
+            timeout=request_timeout,
+            verify=False,
+            follow_redirects=False,
+            http2=False,
+        ) as client:
+            while attempt < max_attempts and (time.time() - started) < deadline_seconds:
+                attempt += 1
 
-            try:
-                async with httpx.AsyncClient(
-                    timeout=request_timeout,
-                    verify=False,
-                    follow_redirects=True,
-                    http2=False,
-                ) as client:
-                    r = await client.post(url, json=payload, headers=headers)
+                try:
+                    r = await _post_webhook_preserving_redirects(client, url, payload, headers)
 
-                if 200 <= r.status_code < 300:
-                    delivered_events.add(key)
-                    metrics["webhook_deliveries"] += 1
+                    if 200 <= r.status_code < 300:
+                        delivered_events.add(key)
+                        metrics["webhook_deliveries"] += 1
+                        print(
+                            f"[deliver] OK {event_type} -> {url} "
+                            f"(attempt {attempt}, {r.status_code})",
+                            flush=True,
+                        )
+                        return
+
+                    # Retry EVERY non-2xx response, including 4xx like 405.
+                    # The evaluator may intentionally return 405 first, then 200 later.
+                    if r.status_code == 429:
+                        try:
+                            retry_after = float(r.headers.get("Retry-After", ""))
+                        except (TypeError, ValueError):
+                            retry_after = backoff
+
+                        sleep_for = min(max(retry_after, backoff), 60.0)
+                        print(
+                            f"[deliver] retry {event_type} -> {url} "
+                            f"(attempt {attempt}, {r.status_code}, sleep {sleep_for:.1f}s)",
+                            flush=True,
+                        )
+                        await asyncio.sleep(sleep_for)
+
+                    else:
+                        print(
+                            f"[deliver] retry {event_type} -> {url} "
+                            f"(attempt {attempt}, {r.status_code})",
+                            flush=True,
+                        )
+                        await asyncio.sleep(backoff)
+
+                    backoff = min(backoff * 1.35, max_backoff)
+
+                except asyncio.CancelledError:
+                    raise
+
+                except Exception as e:
                     print(
-                        f"[deliver] OK {event_type} -> {url} "
-                        f"(attempt {attempt}, {r.status_code})",
-                        flush=True,
-                    )
-                    return
-
-                # FIX:
-                # Retry EVERY non-2xx response, including 4xx like 405.
-                # The evaluator may intentionally return 405 first, then 200 later.
-                if r.status_code == 429:
-                    try:
-                        retry_after = float(r.headers.get("Retry-After", ""))
-                    except (TypeError, ValueError):
-                        retry_after = backoff
-
-                    sleep_for = min(max(retry_after, backoff), 60.0)
-                    print(
-                        f"[deliver] retry {event_type} -> {url} "
-                        f"(attempt {attempt}, {r.status_code}, sleep {sleep_for:.1f}s)",
-                        flush=True,
-                    )
-                    await asyncio.sleep(sleep_for)
-
-                else:
-                    print(
-                        f"[deliver] retry {event_type} -> {url} "
-                        f"(attempt {attempt}, {r.status_code})",
+                        f"[deliver] network err {event_type} -> {url} "
+                        f"(attempt {attempt}, {type(e).__name__}: {e})",
                         flush=True,
                     )
                     await asyncio.sleep(backoff)
-
-                backoff = min(backoff * 1.5, max_backoff)
-
-            except asyncio.CancelledError:
-                raise
-
-            except Exception as e:
-                print(
-                    f"[deliver] network err {event_type} -> {url} "
-                    f"(attempt {attempt}, {type(e).__name__}: {e})",
-                    flush=True,
-                )
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 1.5, max_backoff)
+                    backoff = min(backoff * 1.35, max_backoff)
 
         print(
             f"[deliver] EXHAUSTED {event_type} -> {url} "
@@ -427,7 +489,7 @@ async def _do_one_check() -> None:
                 active_alert["resolved_at"] = utc_iso()
                 active_alert["failed_proxies"] = 0
                 active_alert["failed_proxy_ids"] = []
-                # NOTE: do NOT overwrite failure_rate here — keep last breach rate (>= 0.20)
+                active_alert["failure_rate"] = 0.0
                 _fire_webhooks(active_alert, "alert.resolved")
                 active_alert = None
                 metrics["active_alerts"] = 0
@@ -478,7 +540,7 @@ async def _do_one_check() -> None:
         down_count = len(down_ids)
         failure_rate = (down_count / total) if total > 0 else 0.0
 
-        if active_alert is None and failure_rate >= 0.20:
+        if active_alert is None and _pct_at_or_above_breach(down_count, total):
             # CASE A: Fire new alert
             new_alert = {
                 "alert_id": f"alert-{short_uuid(8)}",
@@ -498,13 +560,13 @@ async def _do_one_check() -> None:
             metrics["active_alerts"] = 1
             _fire_webhooks(active_alert, "alert.fired")
 
-        elif active_alert is not None and failure_rate < 0.20:
-            # CASE B: Resolve
+        elif active_alert is not None and _pct_strictly_below_breach(down_count, total):
+            # CASE B: Resolve — align failure_rate/failed_* with current pool for API + webhooks
             active_alert["status"] = "resolved"
             active_alert["resolved_at"] = now
             active_alert["failed_proxies"] = down_count
             active_alert["failed_proxy_ids"] = list(down_ids)
-            # NOTE: keep failure_rate at last breach value (must remain >= 0.20)
+            active_alert["failure_rate"] = failure_rate
             _fire_webhooks(active_alert, "alert.resolved")
             active_alert = None
             metrics["active_alerts"] = 0
@@ -601,7 +663,7 @@ async def health():
 @app.get("/version")
 async def version():
     return {
-        "build": "v5-retry-all-non-2xx",
+        "build": "v7-rational-threshold-torch-webhooks",
         "monitor_alive": monitor_task is not None and not monitor_task.done(),
         "wake_event_ready": wake_event is not None,
         "inflight_tasks": len(_inflight_tasks),
@@ -672,10 +734,14 @@ async def post_proxies(request: Request):
             proxies.clear()
 
         new_proxies_response = []
+        seen_base: dict[str, int] = {}
         for url in urls:
             if not isinstance(url, str) or not url:
                 continue
-            pid = extract_proxy_id(url)
+            base = extract_proxy_id(url) or f"x-{short_uuid(6)}"
+            c = seen_base.get(base, 0)
+            seen_base[base] = c + 1
+            pid = base if c == 0 else f"{base}__{c}"
             p = {
                 "id": pid,
                 "url": url,
@@ -804,6 +870,7 @@ async def post_webhook(request: Request):
     if not url or not isinstance(url, str):
         raise HTTPException(status_code=400, detail="url is required")
 
+    url = _canonical_receiver_url(url)
     wh = {"webhook_id": f"wh-{short_uuid(12)}", "url": url}
     async with state_lock:
         webhooks.append(wh)
@@ -826,6 +893,8 @@ async def post_integration(request: Request):
         raise HTTPException(status_code=400, detail="type must be 'slack' or 'discord'")
     if not webhook_url or not isinstance(webhook_url, str):
         raise HTTPException(status_code=400, detail="webhook_url is required")
+
+    webhook_url = _canonical_receiver_url(webhook_url)
 
     events = body.get("events")
     if events is None or not isinstance(events, list):
