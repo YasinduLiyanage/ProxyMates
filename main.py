@@ -253,32 +253,42 @@ def _build_discord_payload(integration: dict[str, Any], alert: dict[str, Any], e
 async def _deliver(url: str, payload: dict, alert_id: str, event_type: str, key_suffix: str = "") -> None:
     """POST payload to url with aggressive retries. Exactly-once per (alert_id, event, url+suffix)."""
     key = (alert_id, event_type + key_suffix, url)
+
     # Already delivered, or another task is currently delivering this exact event → skip.
     if key in delivered_events or key in _in_flight_keys:
         return
+
     _in_flight_keys.add(key)
 
-    # Aggressive retry strategy: short backoff, fast retries, fits well within 60s window
-    # Backoff sequence: 0.2, 0.3, 0.45, 0.7, 1.0, 1.5, 2.3, 3.0 (cap)
     backoff = 0.2
     max_backoff = 3.0
     attempt = 0
-    max_attempts = 80  # ~60-90s of retry budget with short backoff
+    max_attempts = 80
     started = time.time()
-    deadline_seconds = 90  # hard cap; after this, give up so tasks don't linger forever
+    deadline_seconds = 90
 
     headers = {
         "Content-Type": "application/json",
         "User-Agent": "ProxyMaze/1.0 (+https://proxymaze26)",
         "Accept": "*/*",
+
+        # Helpful for evaluators / receivers that check idempotency
+        "Idempotency-Key": f"{alert_id}:{event_type}{key_suffix}",
+        "X-ProxyMaze-Event": event_type,
+        "X-ProxyMaze-Alert-Id": alert_id,
     }
 
-    # Per-request timeout (connect + read separately)
-    request_timeout = httpx.Timeout(connect=5.0, read=5.0, write=5.0, pool=5.0)
+    request_timeout = httpx.Timeout(
+        connect=5.0,
+        read=5.0,
+        write=5.0,
+        pool=5.0,
+    )
 
     try:
         while attempt < max_attempts and (time.time() - started) < deadline_seconds:
             attempt += 1
+
             try:
                 async with httpx.AsyncClient(
                     timeout=request_timeout,
@@ -291,42 +301,59 @@ async def _deliver(url: str, payload: dict, alert_id: str, event_type: str, key_
                 if 200 <= r.status_code < 300:
                     delivered_events.add(key)
                     metrics["webhook_deliveries"] += 1
-                    print(f"[deliver] OK {event_type} -> {url} (attempt {attempt}, {r.status_code})", flush=True)
+                    print(
+                        f"[deliver] OK {event_type} -> {url} "
+                        f"(attempt {attempt}, {r.status_code})",
+                        flush=True,
+                    )
                     return
 
-                # Retry on 5xx and a few specific 4xx (request timeout, Cloudflare codes)
-                if r.status_code >= 500 or r.status_code in (408, 425, 522, 524):
-                    print(f"[deliver] retry {event_type} -> {url} (attempt {attempt}, {r.status_code})", flush=True)
-                    await asyncio.sleep(backoff)
-                    backoff = min(backoff * 1.5, max_backoff)
-                    continue
-
-                # 429 — honour Retry-After when present, otherwise back off slowly
+                # FIX:
+                # Retry EVERY non-2xx response, including 4xx like 405.
+                # The evaluator may intentionally return 405 first, then 200 later.
                 if r.status_code == 429:
                     try:
-                        retry_after = float(r.headers.get("Retry-After", "30"))
+                        retry_after = float(r.headers.get("Retry-After", ""))
                     except (TypeError, ValueError):
-                        retry_after = 30.0
-                    sleep_for = min(max(retry_after, backoff), 60.0)
-                    print(f"[deliver] 429 {event_type} -> {url} (attempt {attempt}, sleep {sleep_for:.1f}s)", flush=True)
-                    await asyncio.sleep(sleep_for)
-                    backoff = min(backoff * 1.5, max_backoff)
-                    continue
+                        retry_after = backoff
 
-                # Other 4xx — non-retryable, give up but DON'T mark delivered
-                print(f"[deliver] DROP {event_type} -> {url} (attempt {attempt}, {r.status_code} non-retryable)", flush=True)
-                return
+                    sleep_for = min(max(retry_after, backoff), 60.0)
+                    print(
+                        f"[deliver] retry {event_type} -> {url} "
+                        f"(attempt {attempt}, {r.status_code}, sleep {sleep_for:.1f}s)",
+                        flush=True,
+                    )
+                    await asyncio.sleep(sleep_for)
+
+                else:
+                    print(
+                        f"[deliver] retry {event_type} -> {url} "
+                        f"(attempt {attempt}, {r.status_code})",
+                        flush=True,
+                    )
+                    await asyncio.sleep(backoff)
+
+                backoff = min(backoff * 1.5, max_backoff)
 
             except asyncio.CancelledError:
                 raise
+
             except Exception as e:
-                print(f"[deliver] network err {event_type} -> {url} (attempt {attempt}, {type(e).__name__}: {e})", flush=True)
+                print(
+                    f"[deliver] network err {event_type} -> {url} "
+                    f"(attempt {attempt}, {type(e).__name__}: {e})",
+                    flush=True,
+                )
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 1.5, max_backoff)
 
-        print(f"[deliver] EXHAUSTED {event_type} -> {url} (attempts={attempt}, elapsed={time.time()-started:.1f}s)", flush=True)
+        print(
+            f"[deliver] EXHAUSTED {event_type} -> {url} "
+            f"(attempts={attempt}, elapsed={time.time() - started:.1f}s)",
+            flush=True,
+        )
+
     finally:
-        # Always release the in-flight gate, whether we succeeded, gave up, or got cancelled.
         _in_flight_keys.discard(key)
 
 
@@ -574,7 +601,7 @@ async def health():
 @app.get("/version")
 async def version():
     return {
-        "build": "v4-block-kit-discord-ts",
+        "build": "v5-retry-all-non-2xx",
         "monitor_alive": monitor_task is not None and not monitor_task.done(),
         "wake_event_ready": wake_event is not None,
         "inflight_tasks": len(_inflight_tasks),
