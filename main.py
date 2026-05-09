@@ -243,10 +243,22 @@ async def _deliver(url: str, payload: dict, alert_id: str, event_type: str, key_
                     print(f"[deliver] OK {event_type} -> {url} (attempt {attempt}, {r.status_code})", flush=True)
                     return
 
-                # Retry on 5xx and a few specific 4xx (rate limit, request timeout, Cloudflare codes)
-                if r.status_code >= 500 or r.status_code in (408, 425, 429, 522, 524):
+                # Retry on 5xx and a few specific 4xx (request timeout, Cloudflare codes)
+                if r.status_code >= 500 or r.status_code in (408, 425, 522, 524):
                     print(f"[deliver] retry {event_type} -> {url} (attempt {attempt}, {r.status_code})", flush=True)
                     await asyncio.sleep(backoff)
+                    backoff = min(backoff * 1.5, max_backoff)
+                    continue
+
+                # 429 — honour Retry-After when present, otherwise back off slowly
+                if r.status_code == 429:
+                    try:
+                        retry_after = float(r.headers.get("Retry-After", "30"))
+                    except (TypeError, ValueError):
+                        retry_after = 30.0
+                    sleep_for = min(max(retry_after, backoff), 60.0)
+                    print(f"[deliver] 429 {event_type} -> {url} (attempt {attempt}, sleep {sleep_for:.1f}s)", flush=True)
+                    await asyncio.sleep(sleep_for)
                     backoff = min(backoff * 1.5, max_backoff)
                     continue
 

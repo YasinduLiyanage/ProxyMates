@@ -9,7 +9,7 @@ import json
 import httpx
 import sys
 
-BASE = "http://localhost:8000"
+BASE = "https://proxymaze26-6gjo.onrender.com"
 PASS = 0
 FAIL = 0
 

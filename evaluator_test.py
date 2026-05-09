@@ -18,7 +18,7 @@ import httpx
 from urllib.parse import urlparse
 
 API = "https://proxymates-production.up.railway.app"
-WEBHOOK = "http://localhost:9000"
+WEBHOOK = "https://webhook.site/20ec937c-9a31-4630-9088-c1644a21e977"
 PASS = 0
 FAIL = 0
 ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
