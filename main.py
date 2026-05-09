@@ -323,12 +323,13 @@ async def _deliver(url: str, payload: dict, alert_id: str, event_type: str, key_
 
     _in_flight_keys.add(key)
 
-    backoff = 0.05
-    max_backoff = 2.0
+    # Spec requires delivery within 60s of the state transition. Stay under that.
+    backoff = 0.1
+    max_backoff = 3.0
     attempt = 0
     max_attempts = 200
     started = time.time()
-    deadline_seconds = 240
+    deadline_seconds = 55
 
     headers = {
         "Content-Type": "application/json",
@@ -663,7 +664,7 @@ async def health():
 @app.get("/version")
 async def version():
     return {
-        "build": "v7-rational-threshold-torch-webhooks",
+        "build": "v8-preserve-url-tighter-deadline",
         "monitor_alive": monitor_task is not None and not monitor_task.done(),
         "wake_event_ready": wake_event is not None,
         "inflight_tasks": len(_inflight_tasks),
@@ -870,7 +871,8 @@ async def post_webhook(request: Request):
     if not url or not isinstance(url, str):
         raise HTTPException(status_code=400, detail="url is required")
 
-    url = _canonical_receiver_url(url)
+    # Preserve the URL exactly as the caller sent it in API responses.
+    # _deliver() canonicalizes (HTTPS upgrade, defrag) at send time only.
     wh = {"webhook_id": f"wh-{short_uuid(12)}", "url": url}
     async with state_lock:
         webhooks.append(wh)
@@ -894,7 +896,8 @@ async def post_integration(request: Request):
     if not webhook_url or not isinstance(webhook_url, str):
         raise HTTPException(status_code=400, detail="webhook_url is required")
 
-    webhook_url = _canonical_receiver_url(webhook_url)
+    # Preserve the URL exactly as the caller sent it in API responses.
+    # _deliver() canonicalizes at send time only.
 
     events = body.get("events")
     if events is None or not isinstance(events, list):
