@@ -1,9 +1,4 @@
-"""
-Local webhook receiver — captures all incoming POST requests.
-Run this BEFORE the evaluator test.
-    python webhook_receiver.py
-Runs on port 9000.
-"""
+#Runs on port 9000.
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
