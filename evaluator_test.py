@@ -1,14 +1,4 @@
-"""
-ProxyMaze'26 — Evaluator-Style Black Box Test
-==============================================
 
-Simulates exactly how Torch Labs will evaluate your service.
-
-SETUP (3 terminals):
-  Terminal 1: python webhook_receiver.py          (port 9000)
-  Terminal 2: uvicorn main:app --port 8000        (port 8000)
-  Terminal 3: python evaluator_test.py            (this file)
-"""
 
 import time
 import re
