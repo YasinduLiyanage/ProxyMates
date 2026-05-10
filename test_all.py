@@ -1,8 +1,4 @@
-"""
-Comprehensive test suite for ProxyMaze'26.
-Run the server first: uvicorn main:app --host 0.0.0.0 --port 8000
-Then run: python test_all.py
-"""
+
 
 import time
 import json
